@@ -64,3 +64,161 @@
         modification-timestamp: uint
     }
 )
+
+;; Content provider registry
+(define-map AuthorizedContentProviders
+    { content-provider: principal }
+    {
+        authorization-status: bool,
+        quality-score: uint,
+        lifetime-revenue: uint,
+        registration-block: uint,
+        recent-activity-block: uint
+    }
+)
+
+;; Advertiser performance tracking
+(define-map AdvertiserPerformance
+    { advertiser: principal }
+    {
+        campaign-count: uint,
+        live-campaign-count: uint,
+        lifetime-spend: uint,
+        lifetime-impressions: uint,
+        engagement-rate: uint,
+        trust-score: uint,
+        most-recent-campaign: uint,
+        registration-block: uint
+    }
+)
+
+;; Impression tracking by time period
+(define-map ImpressionsByDay
+    { ad-id: uint, block-day: uint }
+    { impression-count: uint }
+)
+
+;; ========================================
+;; Utility Functions
+;; ========================================
+
+(define-private (compute-commission-amount (payment-amount uint))
+    (/ (* payment-amount (var-get system-fee-basis-points)) u10000)
+)
+
+(define-private (verify-admin-privileges)
+    (is-eq tx-sender (var-get admin-address))
+)
+
+(define-private (check-provider-eligibility (content-provider principal))
+    (match (map-get? AuthorizedContentProviders { content-provider: content-provider })
+        provider-record (get authorization-status provider-record)
+        false
+    )
+)
+
+(define-private (log-daily-impression (ad-id uint))
+    (let
+        (
+            (current-period (/ block-height u144))  ;; Approximately daily blocks
+            (period-data (default-to { impression-count: u0 }
+                (map-get? ImpressionsByDay { ad-id: ad-id, block-day: current-period })))
+        )
+        (map-set ImpressionsByDay
+            { ad-id: ad-id, block-day: current-period }
+            { impression-count: (+ u1 (get impression-count period-data)) }
+        )
+        true  ;; Return success flag
+    )
+)
+
+(define-private (verify-impression-availability (ad-id uint))
+    (let
+        (
+            (ad-data (unwrap-panic (map-get? AdCampaigns { ad-id: ad-id })))
+            (current-period (/ block-height u144))
+            (period-impressions (default-to { impression-count: u0 }
+                (map-get? ImpressionsByDay { ad-id: ad-id, block-day: current-period })))
+        )
+        (<= (get impression-count period-impressions) (get daily-impression-max ad-data))
+    )
+)
+
+;; ========================================
+;; State Update Functions
+;; ========================================
+
+(define-private (update-ad-metrics (ad-id uint))
+    (match (map-get? AdCampaigns { ad-id: ad-id })
+        ad-data
+        (begin
+            (map-set AdCampaigns
+                { ad-id: ad-id }
+                (merge ad-data {
+                    available-funding: (- (get available-funding ad-data) 
+                                     (get impression-price ad-data)),
+                    recorded-impressions: (+ (get recorded-impressions ad-data) u1),
+                    modification-timestamp: block-height
+                })
+            )
+            (ok true)
+        )
+        RESOURCE-NOT-AVAILABLE
+    )
+)
+
+(define-private (update-provider-metrics (content-provider principal) (payment-amount uint))
+    (match (map-get? AuthorizedContentProviders { content-provider: content-provider })
+        provider-data
+        (begin
+            (map-set AuthorizedContentProviders
+                { content-provider: content-provider }
+                (merge provider-data {
+                    lifetime-revenue: (+ (get lifetime-revenue provider-data) payment-amount),
+                    recent-activity-block: block-height
+                })
+            )
+            (ok true)
+        )
+        RESOURCE-NOT-AVAILABLE
+    )
+)
+
+(define-private (update-advertiser-metrics (advertiser principal) (ad-id uint) (deposit-amount uint))
+    (let
+        ((metrics (map-get? AdvertiserPerformance { advertiser: advertiser })))
+        (if (is-some metrics)
+            (let
+                ((existing-metrics (unwrap-panic metrics)))
+                (map-set AdvertiserPerformance
+                    { advertiser: advertiser }
+                    {
+                        campaign-count: (+ u1 (get campaign-count existing-metrics)),
+                        live-campaign-count: (+ u1 (get live-campaign-count existing-metrics)),
+                        lifetime-spend: (+ deposit-amount (get lifetime-spend existing-metrics)),
+                        lifetime-impressions: (get lifetime-impressions existing-metrics),
+                        engagement-rate: u0,
+                        trust-score: u100,
+                        most-recent-campaign: ad-id,
+                        registration-block: (get registration-block existing-metrics)
+                    }
+                )
+            )
+            ;; Initialize new advertiser record
+            (map-set AdvertiserPerformance
+                { advertiser: advertiser }
+                {
+                    campaign-count: u1,
+                    live-campaign-count: u1,
+                    lifetime-spend: deposit-amount,
+                    lifetime-impressions: u0,
+                    engagement-rate: u0,
+                    trust-score: u100,
+                    most-recent-campaign: ad-id,
+                    registration-block: block-height
+                }
+            )
+        )
+    )
+)
+
