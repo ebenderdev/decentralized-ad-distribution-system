@@ -222,3 +222,88 @@
     )
 )
 
+;; ========================================
+;; Core Public Functions
+;; ========================================
+
+;; Log impression with validation
+(define-public (register-impression
+    (ad-id uint)
+    (content-provider principal)
+    (verification-hash (optional (buff 32))))
+
+    (let
+        ((ad-data (unwrap! (map-get? AdCampaigns { ad-id: ad-id }) RESOURCE-NOT-AVAILABLE))
+         (provider-record (unwrap! (map-get? AuthorizedContentProviders { content-provider: content-provider }) 
+                                CONTENT-PROVIDER-UNVERIFIED)))
+
+        ;; Complete validation sequence
+        (asserts! (check-provider-eligibility content-provider) CONTENT-PROVIDER-UNVERIFIED)
+        (asserts! (is-eq (get operational-status ad-data) "active") AD-SUSPENDED)
+        (asserts! (<= block-height (get expiration-block ad-data)) AD-TIMEFRAME-ENDED)
+        (asserts! (>= (get available-funding ad-data) (get impression-price ad-data)) 
+                 PAYMENT-REQUIRED)
+        (asserts! (verify-impression-availability ad-id) IMPRESSION-CAP-REACHED)
+
+        ;; Execute payment to content provider
+        (try! (as-contract (stx-transfer? (get impression-price ad-data) 
+                                        tx-sender 
+                                        content-provider)))
+
+        ;; Update campaign metrics
+        (try! (update-ad-metrics ad-id))
+
+        ;; Record daily impression
+        (asserts! (log-daily-impression ad-id) RESOURCE-NOT-AVAILABLE)
+
+        ;; Update content provider stats
+        (try! (update-provider-metrics content-provider (get impression-price ad-data)))
+
+        (ok true)
+    )
+)
+
+;; ========================================
+;; Administration Functions
+;; ========================================
+
+;; Update system fee rate
+(define-public (modify-system-fee (new-basis-points uint))
+    (begin
+        (asserts! (verify-admin-privileges) ACCESS-DENIED)
+        (asserts! (<= new-basis-points u1000) INVALID-INPUT)  ;; Max 10% (1000 basis points)
+        (var-set system-fee-basis-points new-basis-points)
+        (ok true)
+    )
+)
+
+;; ========================================
+;; Information Retrieval Functions
+;; ========================================
+
+;; Retrieve ad performance data
+(define-read-only (get-ad-performance (ad-id uint))
+    (match (map-get? AdCampaigns { ad-id: ad-id })
+        ad-data 
+        (let
+            ((expenditure (- (get total-funding ad-data) (get available-funding ad-data)))
+             (fulfillment-percentage (/ (* (get recorded-impressions ad-data) u100) 
+                               (get impression-goal ad-data))))
+        (ok {
+            ad-details: ad-data,
+            expenditure: expenditure,
+            fulfillment-percentage: fulfillment-percentage,
+            efficiency-metric: (/ (* (get recorded-impressions ad-data) u100) expenditure)
+        }))
+        RESOURCE-NOT-AVAILABLE
+    )
+)
+
+;; Retrieve content provider statistics
+(define-read-only (get-provider-statistics (content-provider principal))
+    (match (map-get? AuthorizedContentProviders { content-provider: content-provider })
+        provider-data (ok provider-data)
+        RESOURCE-NOT-AVAILABLE
+    )
+)
+
