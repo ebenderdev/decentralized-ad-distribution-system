@@ -64,3 +64,83 @@
         modification-timestamp: uint
     }
 )
+
+;; Content provider registry
+(define-map AuthorizedContentProviders
+    { content-provider: principal }
+    {
+        authorization-status: bool,
+        quality-score: uint,
+        lifetime-revenue: uint,
+        registration-block: uint,
+        recent-activity-block: uint
+    }
+)
+
+;; Advertiser performance tracking
+(define-map AdvertiserPerformance
+    { advertiser: principal }
+    {
+        campaign-count: uint,
+        live-campaign-count: uint,
+        lifetime-spend: uint,
+        lifetime-impressions: uint,
+        engagement-rate: uint,
+        trust-score: uint,
+        most-recent-campaign: uint,
+        registration-block: uint
+    }
+)
+
+;; Impression tracking by time period
+(define-map ImpressionsByDay
+    { ad-id: uint, block-day: uint }
+    { impression-count: uint }
+)
+
+;; ========================================
+;; Utility Functions
+;; ========================================
+
+(define-private (compute-commission-amount (payment-amount uint))
+    (/ (* payment-amount (var-get system-fee-basis-points)) u10000)
+)
+
+(define-private (verify-admin-privileges)
+    (is-eq tx-sender (var-get admin-address))
+)
+
+(define-private (check-provider-eligibility (content-provider principal))
+    (match (map-get? AuthorizedContentProviders { content-provider: content-provider })
+        provider-record (get authorization-status provider-record)
+        false
+    )
+)
+
+(define-private (log-daily-impression (ad-id uint))
+    (let
+        (
+            (current-period (/ block-height u144))  ;; Approximately daily blocks
+            (period-data (default-to { impression-count: u0 }
+                (map-get? ImpressionsByDay { ad-id: ad-id, block-day: current-period })))
+        )
+        (map-set ImpressionsByDay
+            { ad-id: ad-id, block-day: current-period }
+            { impression-count: (+ u1 (get impression-count period-data)) }
+        )
+        true  ;; Return success flag
+    )
+)
+
+(define-private (verify-impression-availability (ad-id uint))
+    (let
+        (
+            (ad-data (unwrap-panic (map-get? AdCampaigns { ad-id: ad-id })))
+            (current-period (/ block-height u144))
+            (period-impressions (default-to { impression-count: u0 }
+                (map-get? ImpressionsByDay { ad-id: ad-id, block-day: current-period })))
+        )
+        (<= (get impression-count period-impressions) (get daily-impression-max ad-data))
+    )
+)
+
